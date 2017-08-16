@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+## Constants
+logFolder="/tmp/swap_script.log"
+standardHostname="fldc"
+prodEnvKey="p"
+boostFactor=100 ## To avoid dealing with floating numbers
+swapTreshold=50 ## Minimum % of swap used required so the script will act
+riskFactor=150 ## 50% risk factor, multiplied by the boostFactor
+
+## Variables
+unixName=$(uname) ## OS name
+hostName=$(hostname)
+environment=$(echo $hostName | cut -c 6-6) ## Retrieving the 6th letter, which indicates server environment
+
+## Functions
+function logging {
+  ## Log relevant data
+  echo "$(date) - $1" 2>&1 | tee -a $logFolder
+}
+
+function validateOS {
+  ## If there's need add AIX, SunOS or HP-UX support
+  if [ "$unixName" = "Linux" ];
+  then
+    logging "$hostName is running $unixName."
+  else
+    logging "$hostName is running an unsupported OS: $unixName. Exiting now."
+    exit
+  fi
+}
+
+function validateHostname {
+  ## Checking if the hostname matches the expected format
+  hostStart=$(echo $hostName | cut -c 1-4) ## Retrieving the first 4 letters 
+  echo $hostStart
+  if [ "$hostStart" != "$standardHostname" ];
+  then
+    logging "$hostName does not match the expected name format, exiting now."
+    exit
+  fi
+}
+
+function validateMemory {
+  ## Releasing cache
+  sync; echo 3 > /proc/sys/vm/drop_caches
+  logging "Cache removal executed"
+  ## Compare available vs needed memory
+  freeMem=$(free | awk 'FNR == 2 {print $4}')
+  freeMemBoosted=$(expr $freeMem \* $boostFactor)
+  swapMem=$(free | awk 'FNR == 3 {print $3}')
+  result=$((freeMemBoosted/swapMem))
+}
+
+function validateSwapTreshold {
+  ## Check if Swap is above treshold
+  totalSwapMem=$(free | awk 'FNR == 3 {print $2}')
+  if [ $totalSwapMem -eq 0 ];
+  then
+    logging "Swap is not in use, exiting now!"
+    exit
+  fi
+  swapMem=$(free | awk 'FNR == 3 {print $3}')
+  swapUseRate=$(expr $swapMem \* $boostFactor / $totalSwapMem)
+  if [ $swapUseRate -lt $swapTreshold ];
+  then
+    logging "Swap usage rate is of $swapUseRate%, this is lower than the current treshold of $swapTreshold%, exiting now."
+    exit
+  fi
+  logging "Swap memory in use is above $swapTreshold% of the available Swap space, continuing with memory validation"
+}
+
+## Start script
+logging "Starting swap_script for $hostName"
+validateOS
+## Check if production
+validateHostname
+if [ "$environment" = "$prodEnvKey" ];
+then
+  logging "Environment is $environment. $hostName is a Production Environment, this script is not intended to be run on it."
+  exit
+else
+  logging "Environment is $environment. $hostName is a Non-production Environment."
+fi
+
+## Validate if Swap should, and is able to, be released
+validateSwapTreshold
+validateMemory
+if [ $result -lt $riskFactor ];
+then
+  logging "Unable to free enough memory to release Swap, free is $((freeMem/1024))M while Swap memory in use is $((swapMem/1024))M, exiting now."
+  exit
+fi
+logging "Swap memory used is $((swapMem/1024))M, free memory is $((freeMem/1024))M, this is enough to release swap according to our risk factor of $riskFactor%"
+
+## Release swap and reenable it
+error=$(swapoff -a 2>&1 1>/dev/null)
+if [ $? -eq 0 ]
+then
+  logging "Swapoff was successful."
+  free -m
+  error=$(swapon -a 2>&1 1>/dev/null)
+  if [ $? -eq 0 ]
+  then
+    swapon -a && logging "Swapon finished."
+    free -m
+    exit
+  else
+    logging "Swapon failed: $error" && exit
+  fi
+else
+  logging "Swapoff failed: $error" && swapon -a && logging "Swapon finished."
+fi
